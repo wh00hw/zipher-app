@@ -10,6 +10,7 @@ pub mod mpp;
 pub mod payment;
 pub mod swap;
 pub mod session;
+pub mod hw_signer;
 
 use std::path::{Path, PathBuf};
 

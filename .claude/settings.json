@@ -1,0 +1,9 @@
+{
+  "permissions": {
+    "allow": [
+      "Read(//home/wh/Projects/zcash-hw-signer/**)",
+      "Bash(wc -l /home/wh/Projects/zipher-app/rust/crates/engine/src/*.rs)",
+      "Read(//home/wh/.cargo/registry/src/**)"
+    ]
+  }
+}

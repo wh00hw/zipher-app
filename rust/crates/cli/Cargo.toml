@@ -25,3 +25,4 @@ toml = "0.8"
 sha2 = "0.10.9"
 reqwest = "0.13.2"
 hex = "0.4.3"
+zcash-hw-signer-sdk = { path = "../../../../zcash-hw-signer" }

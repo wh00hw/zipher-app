@@ -120,6 +120,10 @@ enum Commands {
     /// Session-based payments (prepaid credit via CipherPay)
     #[command(subcommand)]
     Session(SessionCmd),
+
+    /// Hardware wallet operations
+    #[command(subcommand)]
+    HwWallet(HwWalletCmd),
 }
 
 #[derive(Subcommand)]
@@ -232,6 +236,16 @@ enum SessionCmd {
 }
 
 #[derive(Subcommand)]
+enum HwWalletCmd {
+    /// Export FVK from hardware device (for wallet pairing)
+    Pair {
+        /// Hardware device path (e.g. /dev/ttyACM0) or tcp://host:port
+        #[arg(long)]
+        device: String,
+    },
+}
+
+#[derive(Subcommand)]
 enum WalletCmd {
     /// Create a new wallet
     Create,
@@ -283,6 +297,13 @@ enum SendCmd {
 
     /// Sign and broadcast a pending proposal (requires seed)
     Confirm,
+
+    /// Sign and broadcast via hardware wallet (no seed required)
+    ConfirmHw {
+        /// Hardware device path (e.g. /dev/ttyACM0) or tcp://host:port
+        #[arg(long)]
+        device: String,
+    },
 
     /// Show maximum sendable amount to an address
     Max {
@@ -1146,6 +1167,158 @@ async fn cmd_send_confirm(cfg: &Config) -> Result<()> {
 
     zipher_engine::wallet::close().await;
     Ok(())
+}
+
+async fn cmd_send_confirm_hw(cfg: &Config, device: String) -> Result<()> {
+    let pending = load_pending(&cfg.data_dir)?;
+
+    let policy = zipher_engine::policy::load_policy(&cfg.data_dir);
+    if let Err(violation) = zipher_engine::policy::check_rate_limit(&policy) {
+        zipher_engine::audit::log_event(
+            &cfg.data_dir, "confirm_send_hw", Some(&pending.address),
+            Some(pending.amount), None, pending.context_id.as_deref(),
+            None, Some(&violation.to_string()),
+        ).ok();
+        return Err(anyhow::anyhow!("{}", violation));
+    }
+
+    auto_open(cfg).await?;
+
+    let (send_amount, fee, _) = zipher_engine::send::propose_send(
+        &pending.address,
+        pending.amount,
+        pending.memo.clone(),
+        pending.is_max,
+    )
+    .await?;
+
+    if cfg.human {
+        let zec = send_amount as f64 / 1e8;
+        let fee_zec = fee as f64 / 1e8;
+        eprintln!("Confirming via hardware wallet: {:.8} ZEC + {:.8} fee to {}", zec, fee_zec, pending.address);
+        eprintln!("Connecting to device: {}", device);
+    }
+
+    let txid = match hw_confirm(cfg, &device, &pending, send_amount, fee).await {
+        Ok(txid) => {
+            zipher_engine::policy::record_confirm();
+            zipher_engine::audit::log_event(
+                &cfg.data_dir, "confirm_send_hw", Some(&pending.address),
+                Some(send_amount), Some(fee), pending.context_id.as_deref(),
+                Some(&txid), None,
+            ).ok();
+            txid
+        }
+        Err(e) => {
+            zipher_engine::audit::log_event(
+                &cfg.data_dir, "confirm_send_hw", Some(&pending.address),
+                Some(send_amount), Some(fee), pending.context_id.as_deref(),
+                None, Some(&format!("{:#}", e)),
+            ).ok();
+            return Err(e);
+        }
+    };
+
+    delete_pending(&cfg.data_dir);
+
+    #[derive(Serialize)]
+    struct SendResult {
+        txid: String,
+        amount: u64,
+        fee: u64,
+        address: String,
+        signed_by: String,
+    }
+
+    print_ok(
+        SendResult {
+            txid: txid.clone(),
+            amount: send_amount,
+            fee,
+            address: pending.address.clone(),
+            signed_by: "hardware_wallet".to_string(),
+        },
+        cfg.human,
+        |r| {
+            println!("Transaction broadcast (signed by hardware wallet).");
+            println!("  txid: {}", r.txid);
+        },
+    );
+
+    zipher_engine::wallet::close().await;
+    Ok(())
+}
+
+async fn cmd_hw_pair(cfg: &Config, device: String) -> Result<()> {
+    if cfg.human {
+        eprintln!("Connecting to hardware device: {}", device);
+    }
+
+    let fvk = hw_export_fvk(&device)?;
+
+    #[derive(Serialize)]
+    struct FvkExport {
+        ak: String,
+        nk: String,
+        rivk: String,
+    }
+
+    print_ok(
+        FvkExport {
+            ak: hex::encode(&fvk.ak),
+            nk: hex::encode(&fvk.nk),
+            rivk: hex::encode(&fvk.rivk),
+        },
+        cfg.human,
+        |f| {
+            println!("Hardware wallet FVK exported:");
+            println!("  ak:   {}", f.ak);
+            println!("  nk:   {}", f.nk);
+            println!("  rivk: {}", f.rivk);
+            println!();
+            println!("Use this FVK to create a watch-only wallet for the hardware device.");
+        },
+    );
+
+    Ok(())
+}
+
+/// Run the hardware-wallet confirm flow, dispatching by transport type.
+async fn hw_confirm(
+    _cfg: &Config,
+    device: &str,
+    pending: &PendingProposal,
+    send_amount: u64,
+    fee: u64,
+) -> Result<String> {
+    if device.starts_with("tcp://") {
+        let addr = device.trim_start_matches("tcp://");
+        let signer = zcash_hw_signer_sdk::signer::connect_tcp(addr)
+            .map_err(|e| anyhow::anyhow!("TCP connect failed: {:?}", e))?;
+        zipher_engine::hw_signer::confirm_send_hw(
+            signer, &pending.address, send_amount, fee, pending.memo.clone(),
+        ).await
+    } else {
+        let signer = zcash_hw_signer_sdk::signer::connect_serial(device)
+            .map_err(|e| anyhow::anyhow!("Serial connect failed: {:?}", e))?;
+        zipher_engine::hw_signer::confirm_send_hw(
+            signer, &pending.address, send_amount, fee, pending.memo.clone(),
+        ).await
+    }
+}
+
+/// Connect to a hardware device and export its FVK.
+fn hw_export_fvk(device: &str) -> Result<zcash_hw_signer_sdk::ExportedFvk> {
+    if device.starts_with("tcp://") {
+        let addr = device.trim_start_matches("tcp://");
+        let signer = zcash_hw_signer_sdk::signer::connect_tcp(addr)
+            .map_err(|e| anyhow::anyhow!("TCP connect failed: {:?}", e))?;
+        zipher_engine::hw_signer::export_fvk_from_device(signer)
+    } else {
+        let signer = zcash_hw_signer_sdk::signer::connect_serial(device)
+            .map_err(|e| anyhow::anyhow!("Serial connect failed: {:?}", e))?;
+        zipher_engine::hw_signer::export_fvk_from_device(signer)
+    }
 }
 
 async fn cmd_send_max(cfg: &Config, to: String) -> Result<()> {
@@ -2422,6 +2595,7 @@ async fn main() {
                 cmd_send_propose(&cfg, to, amount, memo, context_id).await
             }
             SendCmd::Confirm => cmd_send_confirm(&cfg).await,
+            SendCmd::ConfirmHw { device } => cmd_send_confirm_hw(&cfg, device).await,
             SendCmd::Max { to } => cmd_send_max(&cfg, to).await,
         },
         Commands::Shield => cmd_shield(&cfg).await,
@@ -2471,6 +2645,9 @@ async fn main() {
             }
             SessionCmd::List => cmd_session_list(&cfg).await,
             SessionCmd::Close { session_id } => cmd_session_close(&cfg, session_id).await,
+        },
+        Commands::HwWallet(sub) => match sub {
+            HwWalletCmd::Pair { device } => cmd_hw_pair(&cfg, device).await,
         },
     };
 

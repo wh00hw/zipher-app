@@ -26,8 +26,8 @@ bip0039 = { version = "0.14", features = ["rand"] }
 # Zcash crates
 zcash_protocol = "0.7"
 zcash_address = "0.10"
-zcash_client_backend = { version = "0.21", features = ["lightwalletd-tonic", "transparent-inputs"] }
-zcash_client_sqlite = { version = "0.19", features = ["orchard", "transparent-inputs"] }
+zcash_client_backend = { version = "0.21", features = ["lightwalletd-tonic", "transparent-inputs", "pczt"] }
+zcash_client_sqlite = { version = "0.19", features = ["orchard", "transparent-inputs", "serde"] }
 zcash_keys = { version = "0.12", features = ["orchard", "sapling"] }
 zcash_primitives = "0.26"
 zcash_proofs = "0.26"
@@ -39,3 +39,7 @@ orchard = "0.11"
 incrementalmerkletree = "0.8"
 rustls = { version = "0.23", features = ["ring"] }
 reqwest = { version = "0.13", features = ["json"] }
+
+# Hardware wallet signing
+zcash-hw-signer-sdk = { path = "../../../../zcash-hw-signer" }
+pczt = { version = "0.5", features = ["io-finalizer", "prover", "signer", "spend-finalizer", "tx-extractor"] }

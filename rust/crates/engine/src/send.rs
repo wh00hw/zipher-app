@@ -38,6 +38,12 @@ use zcash_client_sqlite::util::SystemClock;
 
 static PENDING_SEND: StdMutex<Option<ProposalType>> = StdMutex::new(None);
 
+/// Take the pending proposal out of the static, returning `None` if empty.
+/// Used by both `confirm_send` and `hw_signer::confirm_send_hw`.
+pub(crate) fn take_pending_proposal() -> std::sync::MutexGuard<'static, Option<ProposalType>> {
+    PENDING_SEND.lock().unwrap()
+}
+
 // ---------------------------------------------------------------------------
 // Propose / confirm (two-step send flow)
 // ---------------------------------------------------------------------------
@@ -457,7 +463,7 @@ fn propose_and_create_shielding(
     .map_err(|e| anyhow::anyhow!("Create shielding tx failed: {:?}", e))
 }
 
-fn load_prover_from_path(db_data_path: &Path) -> Result<LocalTxProver> {
+pub(crate) fn load_prover_from_path(db_data_path: &Path) -> Result<LocalTxProver> {
     let wallet_dir = db_data_path
         .parent()
         .ok_or_else(|| anyhow::anyhow!("Cannot determine data directory"))?;
