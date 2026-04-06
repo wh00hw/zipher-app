@@ -4877,7 +4877,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "zcash-hw-signer-sdk"
+name = "zcash-hw-wallet-sdk"
 version = "0.1.0"
 dependencies = [
  "anyhow",
@@ -4889,8 +4889,12 @@ dependencies = [
  "serde",
  "serde_json",
  "serialport",
+ "subtle",
  "thiserror 2.0.18",
  "tracing",
+ "zcash_address",
+ "zcash_protocol",
+ "zeroize",
 ]
 
 [[package]]
@@ -5328,7 +5332,7 @@ dependencies = [
  "toml",
  "tracing",
  "tracing-subscriber",
- "zcash-hw-signer-sdk",
+ "zcash-hw-wallet-sdk",
  "zcash_protocol",
  "zeroize",
  "zipher-engine",
@@ -5361,7 +5365,7 @@ dependencies = [
  "toml",
  "tonic",
  "tracing",
- "zcash-hw-signer-sdk",
+ "zcash-hw-wallet-sdk",
  "zcash_address",
  "zcash_client_backend",
  "zcash_client_sqlite",

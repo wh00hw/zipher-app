@@ -237,11 +237,15 @@ enum SessionCmd {
 
 #[derive(Subcommand)]
 enum HwWalletCmd {
-    /// Export FVK from hardware device (for wallet pairing)
+    /// Pair hardware device: export FVK and create watch-only wallet
     Pair {
         /// Hardware device path (e.g. /dev/ttyACM0) or tcp://host:port
         #[arg(long)]
         device: String,
+
+        /// Birthday height for faster sync
+        #[arg(long, default_value = "1")]
+        birthday: u32,
     },
 }
 
@@ -1249,34 +1253,43 @@ async fn cmd_send_confirm_hw(cfg: &Config, device: String) -> Result<()> {
     Ok(())
 }
 
-async fn cmd_hw_pair(cfg: &Config, device: String) -> Result<()> {
+async fn cmd_hw_pair(cfg: &Config, device: String, birthday: u32) -> Result<()> {
     if cfg.human {
         eprintln!("Connecting to hardware device: {}", device);
     }
 
-    let fvk = hw_export_fvk(&device)?;
+    let signer = zcash_hw_wallet_sdk::signer::connect_serial(&device)
+        .map_err(|e| anyhow::anyhow!("Serial connect failed: {:?}", e))?;
+    let (fvk, ufvk_str) = zipher_engine::hw_signer::pair_device(
+        signer, &cfg.data_dir, &cfg.server_url, cfg.network, birthday, None,
+    ).await?;
 
     #[derive(Serialize)]
-    struct FvkExport {
+    struct PairResult {
         ak: String,
         nk: String,
         rivk: String,
+        ufvk: String,
+        wallet_created: bool,
     }
 
     print_ok(
-        FvkExport {
+        PairResult {
             ak: hex::encode(&fvk.ak),
             nk: hex::encode(&fvk.nk),
             rivk: hex::encode(&fvk.rivk),
+            ufvk: ufvk_str,
+            wallet_created: true,
         },
         cfg.human,
-        |f| {
-            println!("Hardware wallet FVK exported:");
-            println!("  ak:   {}", f.ak);
-            println!("  nk:   {}", f.nk);
-            println!("  rivk: {}", f.rivk);
+        |r| {
+            println!("Hardware wallet paired successfully!");
+            println!("  ak:   {}", r.ak);
+            println!("  nk:   {}", r.nk);
+            println!("  rivk: {}", r.rivk);
+            println!("  ufvk: {}", r.ufvk);
             println!();
-            println!("Use this FVK to create a watch-only wallet for the hardware device.");
+            println!("Watch-only wallet created. Run `zipher-cli sync start` to sync.");
         },
     );
 
@@ -1291,34 +1304,11 @@ async fn hw_confirm(
     send_amount: u64,
     fee: u64,
 ) -> Result<String> {
-    if device.starts_with("tcp://") {
-        let addr = device.trim_start_matches("tcp://");
-        let signer = zcash_hw_signer_sdk::signer::connect_tcp(addr)
-            .map_err(|e| anyhow::anyhow!("TCP connect failed: {:?}", e))?;
-        zipher_engine::hw_signer::confirm_send_hw(
-            signer, &pending.address, send_amount, fee, pending.memo.clone(),
-        ).await
-    } else {
-        let signer = zcash_hw_signer_sdk::signer::connect_serial(device)
-            .map_err(|e| anyhow::anyhow!("Serial connect failed: {:?}", e))?;
-        zipher_engine::hw_signer::confirm_send_hw(
-            signer, &pending.address, send_amount, fee, pending.memo.clone(),
-        ).await
-    }
-}
-
-/// Connect to a hardware device and export its FVK.
-fn hw_export_fvk(device: &str) -> Result<zcash_hw_signer_sdk::ExportedFvk> {
-    if device.starts_with("tcp://") {
-        let addr = device.trim_start_matches("tcp://");
-        let signer = zcash_hw_signer_sdk::signer::connect_tcp(addr)
-            .map_err(|e| anyhow::anyhow!("TCP connect failed: {:?}", e))?;
-        zipher_engine::hw_signer::export_fvk_from_device(signer)
-    } else {
-        let signer = zcash_hw_signer_sdk::signer::connect_serial(device)
-            .map_err(|e| anyhow::anyhow!("Serial connect failed: {:?}", e))?;
-        zipher_engine::hw_signer::export_fvk_from_device(signer)
-    }
+    let signer = zcash_hw_wallet_sdk::signer::connect_serial(device)
+        .map_err(|e| anyhow::anyhow!("Serial connect failed: {:?}", e))?;
+    zipher_engine::hw_signer::confirm_send_hw(
+        signer, &pending.address, send_amount, fee, pending.memo.clone(),
+    ).await
 }
 
 async fn cmd_send_max(cfg: &Config, to: String) -> Result<()> {
@@ -2647,7 +2637,7 @@ async fn main() {
             SessionCmd::Close { session_id } => cmd_session_close(&cfg, session_id).await,
         },
         Commands::HwWallet(sub) => match sub {
-            HwWalletCmd::Pair { device } => cmd_hw_pair(&cfg, device).await,
+            HwWalletCmd::Pair { device, birthday } => cmd_hw_pair(&cfg, device, birthday).await,
         },
     };
 

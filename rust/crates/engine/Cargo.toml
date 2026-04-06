@@ -41,5 +41,5 @@ rustls = { version = "0.23", features = ["ring"] }
 reqwest = { version = "0.13", features = ["json"] }
 
 # Hardware wallet signing
-zcash-hw-signer-sdk = { path = "../../../../zcash-hw-signer" }
+zcash-hw-wallet-sdk = { path = "../../../../zcash-hw-signer" }
 pczt = { version = "0.5", features = ["io-finalizer", "prover", "signer", "spend-finalizer", "tx-extractor"] }

@@ -13,7 +13,7 @@ use zcash_client_backend::data_api::wallet::{
 use zcash_client_backend::data_api::WalletRead;
 use zcash_client_backend::wallet::OvkPolicy;
 use zcash_client_backend::proto::service::RawTransaction;
-use zcash_hw_signer_sdk::{
+use zcash_hw_wallet_sdk::{
     HardwareSigner, PcztHardwareSigning, TxDetails,
 };
 
@@ -165,18 +165,40 @@ pub async fn confirm_send_hw<S: HardwareSigner>(
     Ok(txid.to_string())
 }
 
-/// Export the full viewing key from a connected hardware device.
+/// Pair a hardware device: export FVK and create a watch-only wallet.
 ///
-/// This is used during initial pairing: the FVK is imported into the wallet
-/// as a watch-only account so the app can derive addresses and scan the chain.
-pub fn export_fvk_from_device<S: HardwareSigner>(
+/// 1. Exports the Orchard FVK from the device via the SDK
+/// 2. Encodes it as a UFVK using `ExportedFvk::to_ufvk_string`
+/// 3. Creates a watch-only wallet via `restore_from_ufvk`
+pub async fn pair_device<S: HardwareSigner>(
     mut signer: S,
-) -> Result<zcash_hw_signer_sdk::ExportedFvk> {
-    info!("[HW] Requesting FVK export from hardware device...");
+    data_dir: &str,
+    server_url: &str,
+    params: zcash_protocol::consensus::Network,
+    birthday_height: u32,
+    db_cipher_key: Option<String>,
+) -> Result<(zcash_hw_wallet_sdk::ExportedFvk, String)> {
+    info!("[HW-PAIR] Requesting FVK export from hardware device...");
     let fvk = signer.export_fvk().map_err(|e| {
-        error!("[HW] FVK export failed: {:?}", e);
+        error!("[HW-PAIR] FVK export failed: {:?}", e);
         anyhow::anyhow!("FVK export failed: {:?}", e)
     })?;
-    info!("[HW] FVK exported: ak={}, nk={}", hex::encode(&fvk.ak), hex::encode(&fvk.nk));
-    Ok(fvk)
+    info!("[HW-PAIR] FVK exported: ak={}, nk={}", hex::encode(&fvk.ak), hex::encode(&fvk.nk));
+
+    let ufvk_str = fvk.to_ufvk_string(&params)
+        .map_err(|e| anyhow::anyhow!("UFVK encoding failed: {:?}", e))?;
+    info!("[HW-PAIR] UFVK encoded. Creating watch-only wallet...");
+
+    super::wallet::restore_from_ufvk(
+        data_dir,
+        server_url,
+        params,
+        &ufvk_str,
+        birthday_height,
+        db_cipher_key,
+    )
+    .await?;
+
+    info!("[HW-PAIR] Watch-only wallet created. Ready to sync.");
+    Ok((fvk, ufvk_str))
 }
