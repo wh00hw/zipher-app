@@ -34,12 +34,12 @@ zcash_proofs = "0.26"
 zcash_transparent = "0.6"
 zcash_script = "0.4"
 zip32 = "0.2"
-sapling-crypto = { version = "0.5", package = "sapling-crypto" }
-orchard = "0.11"
+sapling-crypto = { version = "0.6", package = "sapling-crypto" }
+orchard = "0.12"
 incrementalmerkletree = "0.8"
 rustls = { version = "0.23", features = ["ring"] }
 reqwest = { version = "0.13", features = ["json"] }
 
 # Hardware wallet signing
-zcash-hw-wallet-sdk = { path = "../../../../zcash-hw-signer" }
+zcash-hw-wallet-sdk = { path = "../../../zcash-hw-wallet-sdk" }
 pczt = { version = "0.5", features = ["io-finalizer", "prover", "signer", "spend-finalizer", "tx-extractor"] }

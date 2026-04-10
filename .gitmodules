@@ -4,3 +4,6 @@
 [submodule "native/zcash-params"]
 	path = native/zcash-params
 	url = https://github.com/hhanh00/zcash-params.git
+[submodule "zcash-hw-wallet-sdk"]
+	path = zcash-hw-wallet-sdk
+	url = https://github.com/wh00hw/zcash-hw-wallet-sdk.git

@@ -126,7 +126,7 @@ pub async fn propose_send(
             .transaction_request()
             .payments()
             .values()
-            .map(|p| u64::from(p.amount()))
+            .filter_map(|p| p.amount().map(u64::from))
             .sum();
 
         info!("[PROPOSE] MAX proposal OK. send_amount={}, fee={}", send_amount, fee);
@@ -178,7 +178,7 @@ pub async fn confirm_send(seed_phrase: &SecretString) -> Result<String> {
         step.is_shielding());
     for (idx, payment) in step.transaction_request().payments() {
         info!("[CONFIRM]   payment[{}]: addr={}, amount={}", idx,
-            payment.recipient_address(), u64::from(payment.amount()));
+            payment.recipient_address(), payment.amount().map(u64::from).unwrap_or(0));
     }
     for (i, utxo) in step.transparent_inputs().iter().enumerate() {
         info!("[CONFIRM]   t_input[{}]: outpoint={}:{}, value={}", i,
@@ -362,7 +362,7 @@ pub async fn get_max_sendable(address: &str) -> Result<u64> {
                 .transaction_request()
                 .payments()
                 .values()
-                .map(|p| u64::from(p.amount()))
+                .filter_map(|p| p.amount().map(u64::from))
                 .sum();
             Ok(send_amount)
         }
@@ -446,6 +446,7 @@ fn propose_and_create_shielding(
         from_addrs,
         to_account,
         ConfirmationsPolicy::MIN,
+        zcash_client_backend::data_api::TransparentOutputFilter::All,
     )
     .map_err(|e| anyhow::anyhow!("Shielding proposal failed: {:?}", e))?;
 

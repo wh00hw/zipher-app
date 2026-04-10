@@ -8,6 +8,7 @@ use clap::{Parser, Subcommand};
 use secrecy::SecretString;
 use serde::Serialize;
 use zcash_protocol::consensus::Network;
+use zcash_hw_wallet_sdk::types::coin_type_for_network;
 
 // ---------------------------------------------------------------------------
 // CLI definition
@@ -1258,11 +1259,32 @@ async fn cmd_hw_pair(cfg: &Config, device: String, birthday: u32) -> Result<()> 
         eprintln!("Connecting to hardware device: {}", device);
     }
 
-    let signer = zcash_hw_wallet_sdk::signer::connect_serial(&device)
-        .map_err(|e| anyhow::anyhow!("Serial connect failed: {:?}", e))?;
-    let (fvk, ufvk_str) = zipher_engine::hw_signer::pair_device(
-        signer, &cfg.data_dir, &cfg.server_url, cfg.network, birthday, None,
-    ).await?;
+    let coin_type = coin_type_for_network(&cfg.network);
+
+    let (fvk, ufvk_str) = if device == "ledger" {
+        let signer = zcash_hw_wallet_sdk::signer::connect_ledger(coin_type)
+            .map_err(|e| anyhow::anyhow!("Ledger connect failed: {:?}", e))?;
+        zipher_engine::hw_signer::pair_device(
+            signer, &cfg.data_dir, &cfg.server_url, cfg.network, birthday, None,
+        ).await?
+    } else if device.starts_with("speculos") {
+        let addr = if device.contains(':') {
+            device.strip_prefix("speculos:").unwrap_or("127.0.0.1:9999")
+        } else {
+            "127.0.0.1:9999"
+        };
+        let signer = zcash_hw_wallet_sdk::signer::connect_speculos(addr, coin_type)
+            .map_err(|e| anyhow::anyhow!("Speculos connect failed: {:?}", e))?;
+        zipher_engine::hw_signer::pair_device(
+            signer, &cfg.data_dir, &cfg.server_url, cfg.network, birthday, None,
+        ).await?
+    } else {
+        let signer = zcash_hw_wallet_sdk::signer::connect_serial(&device, coin_type)
+            .map_err(|e| anyhow::anyhow!("Serial connect failed: {:?}", e))?;
+        zipher_engine::hw_signer::pair_device(
+            signer, &cfg.data_dir, &cfg.server_url, cfg.network, birthday, None,
+        ).await?
+    };
 
     #[derive(Serialize)]
     struct PairResult {
@@ -1298,13 +1320,34 @@ async fn cmd_hw_pair(cfg: &Config, device: String, birthday: u32) -> Result<()> 
 
 /// Run the hardware-wallet confirm flow, dispatching by transport type.
 async fn hw_confirm(
-    _cfg: &Config,
+    cfg: &Config,
     device: &str,
     pending: &PendingProposal,
     send_amount: u64,
     fee: u64,
 ) -> Result<String> {
-    let signer = zcash_hw_wallet_sdk::signer::connect_serial(device)
+    let coin_type = coin_type_for_network(&cfg.network);
+
+    if device == "ledger" {
+        let signer = zcash_hw_wallet_sdk::signer::connect_ledger(coin_type)
+            .map_err(|e| anyhow::anyhow!("Ledger connect failed: {:?}", e))?;
+        return zipher_engine::hw_signer::confirm_send_hw(
+            signer, &pending.address, send_amount, fee, pending.memo.clone(),
+        ).await;
+    }
+    if device.starts_with("speculos") {
+        let addr = if device.contains(':') {
+            device.strip_prefix("speculos:").unwrap_or("127.0.0.1:9999")
+        } else {
+            "127.0.0.1:9999"
+        };
+        let signer = zcash_hw_wallet_sdk::signer::connect_speculos(addr, coin_type)
+            .map_err(|e| anyhow::anyhow!("Speculos connect failed: {:?}", e))?;
+        return zipher_engine::hw_signer::confirm_send_hw(
+            signer, &pending.address, send_amount, fee, pending.memo.clone(),
+        ).await;
+    }
+    let signer = zcash_hw_wallet_sdk::signer::connect_serial(device, coin_type)
         .map_err(|e| anyhow::anyhow!("Serial connect failed: {:?}", e))?;
     zipher_engine::hw_signer::confirm_send_hw(
         signer, &pending.address, send_amount, fee, pending.memo.clone(),

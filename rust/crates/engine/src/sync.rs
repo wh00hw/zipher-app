@@ -819,6 +819,7 @@ async fn download_blocks(
             height: u64::from(u32::from(to) - 1),
             hash: vec![],
         }),
+        pool_types: vec![],
     };
 
     let mut stream = lwd
