@@ -37,6 +37,7 @@ ZIPHER_SEED="..." zipher-cli send confirm
 
 - **Light client** — syncs in minutes, runs on a $5 VPS or Raspberry Pi
 - **Two-step send** — propose (no seed) then confirm (seed required), safe for agent workflows
+- **Hardware wallet signing** — PCZT flow for Orchard + transparent inputs via Ledger / any HWP v2/v3 device, with on-device ZIP-244 sighash and transparent-digest verification (no seed on host)
 - **Spending policy** — per-tx limits, daily caps, allowlist, rate limiting
 - **Audit log** — every spend recorded with timestamps and context IDs
 - **Daemon mode** — background sync with IPC, kill switch to zeroize seed in memory
@@ -67,6 +68,7 @@ The engine crate is the single source of truth for wallet logic. Every consumer 
 
 - [Flutter](https://flutter.dev) — mobile UI (iOS & Android)
 - [librustzcash](https://github.com/zcash/librustzcash) — Zcash protocol libraries and light client SDK
+- [zcash-hw-wallet-sdk](https://github.com/wh00hw/zcash-hw-wallet-sdk) + [libzcash-orchard-c](https://github.com/wh00hw/libzcash-orchard-c) — PCZT-based hardware wallet signing (Orchard + transparent, on-device ZIP-244 verification)
 - [rmcp](https://github.com/anthropics/rmcp) — Model Context Protocol server SDK
 - [NEAR Intents](https://near.org/intents) — cross-chain swap infrastructure
 

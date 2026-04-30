@@ -4897,6 +4897,7 @@ dependencies = [
  "orchard",
  "pczt",
  "reddsa",
+ "secp256k1",
  "serde",
  "serde_json",
  "serialport",

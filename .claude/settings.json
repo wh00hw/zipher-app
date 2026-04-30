@@ -3,7 +3,21 @@
     "allow": [
       "Read(//home/wh/Projects/zcash-hw-signer/**)",
       "Bash(wc -l /home/wh/Projects/zipher-app/rust/crates/engine/src/*.rs)",
-      "Read(//home/wh/.cargo/registry/src/**)"
+      "Read(//home/wh/.cargo/registry/src/**)",
+      "Bash(git -C /home/wh/Projects/zipher-app log --oneline --all)",
+      "Bash(git -C /home/wh/Projects/zipher-app show aa18d6b --stat)",
+      "Read(//home/wh/Projects/**)",
+      "Bash(git -C /home/wh/Projects/zipher-app show aa18d6b)",
+      "Bash(git -C /home/wh/Projects/zipher-app log --all --oneline --grep=\"hw\\\\|hardware\\\\|signer\" -i)",
+      "Bash(git -C /home/wh/Projects/zipher-app show c123ddc --stat)",
+      "Bash(git -C /home/wh/Projects/zipher-app status)",
+      "Bash(git -C /home/wh/Projects/zipher-app diff rust/Cargo.lock)",
+      "Bash(git -C /home/wh/Projects/zipher-app diff rust/crates/cli/Cargo.toml)",
+      "Bash(git -C /home/wh/Projects/zipher-app log --oneline)",
+      "Bash(git submodule:*)",
+      "Bash(cargo check:*)",
+      "Bash(cargo tree:*)",
+      "Bash(cargo build:*)"
     ]
   }
 }

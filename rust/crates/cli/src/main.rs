@@ -248,6 +248,10 @@ enum HwWalletCmd {
         #[arg(long, default_value = "1")]
         birthday: u32,
     },
+
+    /// Query a connected Ledger running Hanh's native Zcash app via APDU
+    /// (reports app version and Orchard FVK — does not create a wallet)
+    Info,
 }
 
 #[derive(Subcommand)]
@@ -1312,6 +1316,60 @@ async fn cmd_hw_pair(cfg: &Config, device: String, birthday: u32) -> Result<()> 
             println!("  ufvk: {}", r.ufvk);
             println!();
             println!("Watch-only wallet created. Run `zipher-cli sync start` to sync.");
+        },
+    );
+
+    Ok(())
+}
+
+/// Probe a connected Ledger running Hanh's native Zcash app (APDU pipeline),
+/// reporting the on-device app version and the Orchard FVK.
+async fn cmd_hw_info(cfg: &Config) -> Result<()> {
+    if cfg.human {
+        eprintln!("Connecting to Ledger (Hanh app, native APDU)...");
+    }
+
+    let client = zcash_hw_wallet_sdk::signer::connect_ledger_apdu()
+        .map_err(|e| anyhow::anyhow!("Ledger connect failed: {:?}", e))?;
+
+    let version = client
+        .get_version()
+        .map_err(|e| anyhow::anyhow!("GET_VERSION failed: {:?}", e))?;
+    let fvk = client
+        .get_ofvk()
+        .map_err(|e| anyhow::anyhow!("GET_OFVK failed: {:?}", e))?;
+    let ufvk_str = fvk
+        .to_ufvk_string(&cfg.network)
+        .map_err(|e| anyhow::anyhow!("UFVK encoding failed: {:?}", e))?;
+
+    #[derive(Serialize)]
+    struct HwInfo {
+        transport: &'static str,
+        app: &'static str,
+        version: String,
+        ak: String,
+        nk: String,
+        rivk: String,
+        ufvk: String,
+    }
+
+    print_ok(
+        HwInfo {
+            transport: "ledger-apdu",
+            app: "hanh-zcash-ledger",
+            version: format!("{}.{}.{}", version[0], version[1], version[2]),
+            ak: hex::encode(&fvk.ak),
+            nk: hex::encode(&fvk.nk),
+            rivk: hex::encode(&fvk.rivk),
+            ufvk: ufvk_str,
+        },
+        cfg.human,
+        |r| {
+            println!("Ledger connected (app: {}, v{}).", r.app, r.version);
+            println!("  ak:   {}", r.ak);
+            println!("  nk:   {}", r.nk);
+            println!("  rivk: {}", r.rivk);
+            println!("  ufvk: {}", r.ufvk);
         },
     );
 
@@ -2681,6 +2739,7 @@ async fn main() {
         },
         Commands::HwWallet(sub) => match sub {
             HwWalletCmd::Pair { device, birthday } => cmd_hw_pair(&cfg, device, birthday).await,
+            HwWalletCmd::Info => cmd_hw_info(&cfg).await,
         },
     };
 

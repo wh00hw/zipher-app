@@ -98,8 +98,8 @@ pub async fn confirm_send_hw<S: HardwareSigner>(
         })?;
 
     info!(
-        "[HW-CONFIRM] Hardware signed OK: {} action(s)",
-        result.actions_signed
+        "[HW-CONFIRM] Hardware signed OK: {} orchard action(s), {} transparent input(s)",
+        result.actions_signed, result.transparent_inputs_signed,
     );
 
     // Step 3: Parse signed PCZT and extract transaction
