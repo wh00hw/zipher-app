@@ -238,20 +238,38 @@ enum SessionCmd {
 
 #[derive(Subcommand)]
 enum HwWalletCmd {
-    /// Pair hardware device: export FVK and create watch-only wallet
+    /// Pair hardware device: query identity pubkey (audit M1), export FVK,
+    /// and create a watch-only wallet from the resulting UFVK.
+    ///
+    /// Use `--probe` to query the device WITHOUT creating a wallet — handy
+    /// for capturing the device pubkey at first setup or as a connectivity
+    /// smoke test.
     Pair {
-        /// Hardware device path (e.g. /dev/ttyACM0) or tcp://host:port
+        /// Hardware device path: `/dev/ttyACM0` (Flipper Zero / ESP32),
+        /// `ledger`, `speculos[:host:port]`, or `tcp:host:port` (HWP fixture).
         #[arg(long)]
         device: String,
 
-        /// Birthday height for faster sync
+        /// Birthday height for faster sync (ignored when --probe is set).
         #[arg(long, default_value = "1")]
         birthday: u32,
+
+        /// Don't create a watch-only wallet; just report device identity + FVK.
+        #[arg(long)]
+        probe: bool,
     },
 
-    /// Query a connected Ledger running Hanh's native Zcash app via APDU
-    /// (reports app version and Orchard FVK — does not create a wallet)
-    Info,
+    /// Verify a connected device's identity against a previously-pinned
+    /// pubkey (audit M1). Sends a fresh challenge and validates the
+    /// RedPallas signature. Use after `pair` to detect device substitution.
+    Attest {
+        #[arg(long)]
+        device: String,
+        /// 64-hex-char device pubkey recorded at first pairing
+        /// (printed by the device on its trusted first-boot console).
+        #[arg(long)]
+        pubkey: String,
+    },
 }
 
 #[derive(Subcommand)]
@@ -1258,40 +1276,51 @@ async fn cmd_send_confirm_hw(cfg: &Config, device: String) -> Result<()> {
     Ok(())
 }
 
-async fn cmd_hw_pair(cfg: &Config, device: String, birthday: u32) -> Result<()> {
+async fn cmd_hw_pair(cfg: &Config, device: String, birthday: u32, probe: bool) -> Result<()> {
     if cfg.human {
         eprintln!("Connecting to hardware device: {}", device);
     }
 
     let coin_type = coin_type_for_network(&cfg.network);
 
-    let (fvk, ufvk_str) = if device == "ledger" {
-        let signer = zcash_hw_wallet_sdk::signer::connect_ledger(coin_type)
-            .map_err(|e| anyhow::anyhow!("Ledger connect failed: {:?}", e))?;
-        zipher_engine::hw_signer::pair_device(
-            signer, &cfg.data_dir, &cfg.server_url, cfg.network, birthday, None,
-        ).await?
-    } else if device.starts_with("speculos") {
-        let addr = if device.contains(':') {
-            device.strip_prefix("speculos:").unwrap_or("127.0.0.1:9999")
-        } else {
-            "127.0.0.1:9999"
-        };
-        let signer = zcash_hw_wallet_sdk::signer::connect_speculos(addr, coin_type)
-            .map_err(|e| anyhow::anyhow!("Speculos connect failed: {:?}", e))?;
-        zipher_engine::hw_signer::pair_device(
-            signer, &cfg.data_dir, &cfg.server_url, cfg.network, birthday, None,
-        ).await?
+    // Single connect path via the trait-object dispatcher (same that
+    // `attest` uses). Captures the device pubkey (audit M1) before the
+    // FVK so we can include both in the output regardless of `--probe`.
+    let mut signer = connect_dispatch(&device, coin_type)?;
+
+    let device_pubkey = signer.pair_identity().ok().map(hex::encode);
+
+    let fvk = signer
+        .export_fvk_dyn()
+        .map_err(|e| anyhow::anyhow!("FVK export failed: {:?}", e))?;
+    let ufvk_str = fvk
+        .to_ufvk_string(&cfg.network)
+        .map_err(|e| anyhow::anyhow!("UFVK encoding failed: {:?}", e))?;
+
+    // Drop the trait-object signer BEFORE the wallet-creation step; it
+    // holds the serial port FD and the wallet step does network I/O that
+    // does not need the device.
+    drop(signer);
+
+    let wallet_created = if probe {
+        false
     } else {
-        let signer = zcash_hw_wallet_sdk::signer::connect_serial(&device, coin_type)
-            .map_err(|e| anyhow::anyhow!("Serial connect failed: {:?}", e))?;
-        zipher_engine::hw_signer::pair_device(
-            signer, &cfg.data_dir, &cfg.server_url, cfg.network, birthday, None,
-        ).await?
+        zipher_engine::wallet::restore_from_ufvk(
+            &cfg.data_dir,
+            &cfg.server_url,
+            cfg.network,
+            &ufvk_str,
+            birthday,
+            None,
+        )
+        .await?;
+        true
     };
 
     #[derive(Serialize)]
     struct PairResult {
+        device: String,
+        device_pubkey: Option<String>,
         ak: String,
         nk: String,
         rivk: String,
@@ -1301,79 +1330,137 @@ async fn cmd_hw_pair(cfg: &Config, device: String, birthday: u32) -> Result<()> 
 
     print_ok(
         PairResult {
+            device: device.clone(),
+            device_pubkey: device_pubkey.clone(),
             ak: hex::encode(&fvk.ak),
             nk: hex::encode(&fvk.nk),
             rivk: hex::encode(&fvk.rivk),
             ufvk: ufvk_str,
-            wallet_created: true,
+            wallet_created,
         },
         cfg.human,
         |r| {
-            println!("Hardware wallet paired successfully!");
+            if r.wallet_created {
+                println!("Hardware wallet paired successfully!");
+            } else {
+                println!("Probe (no wallet created):");
+            }
+            if let Some(pk) = &r.device_pubkey {
+                println!("  device-pubkey: {}", pk);
+                println!("    (record this for `attest --pubkey <hex>` to detect");
+                println!("     device substitution in subsequent sessions)");
+            } else {
+                println!("  device-pubkey: <unsupported by this firmware>");
+            }
             println!("  ak:   {}", r.ak);
             println!("  nk:   {}", r.nk);
             println!("  rivk: {}", r.rivk);
             println!("  ufvk: {}", r.ufvk);
-            println!();
-            println!("Watch-only wallet created. Run `zipher-cli sync start` to sync.");
+            if r.wallet_created {
+                println!();
+                println!("Watch-only wallet created. Run `zipher-cli sync start` to sync.");
+            }
         },
     );
 
     Ok(())
 }
 
-/// Probe a connected Ledger running Hanh's native Zcash app (APDU pipeline),
-/// reporting the on-device app version and the Orchard FVK.
-async fn cmd_hw_info(cfg: &Config) -> Result<()> {
-    if cfg.human {
-        eprintln!("Connecting to Ledger (Hanh app, native APDU)...");
-    }
+/// Verify the connected device matches a previously-pinned pubkey.
+/// Sends a fresh OsRng challenge, returns OK only if the device's
+/// RedPallas attestation signature verifies AND the returned `rk`
+/// equals the pinned pubkey byte-for-byte (audit M1).
+async fn cmd_hw_attest(cfg: &Config, device: String, pubkey_hex: String) -> Result<()> {
+    let pinned: [u8; 32] = hex::decode(&pubkey_hex)
+        .map_err(|e| anyhow::anyhow!("pubkey not valid hex: {}", e))?
+        .try_into()
+        .map_err(|v: Vec<u8>| anyhow::anyhow!("pubkey must be 32 bytes, got {}", v.len()))?;
 
-    let client = zcash_hw_wallet_sdk::signer::connect_ledger_apdu()
-        .map_err(|e| anyhow::anyhow!("Ledger connect failed: {:?}", e))?;
+    let coin_type = coin_type_for_network(&cfg.network);
+    let mut signer = connect_dispatch(&device, coin_type)?;
 
-    let version = client
-        .get_version()
-        .map_err(|e| anyhow::anyhow!("GET_VERSION failed: {:?}", e))?;
-    let fvk = client
-        .get_ofvk()
-        .map_err(|e| anyhow::anyhow!("GET_OFVK failed: {:?}", e))?;
-    let ufvk_str = fvk
-        .to_ufvk_string(&cfg.network)
-        .map_err(|e| anyhow::anyhow!("UFVK encoding failed: {:?}", e))?;
+    signer
+        .attest_dyn(&pinned)
+        .map_err(|e| anyhow::anyhow!("Attestation FAILED: {:?}", e))?;
 
     #[derive(Serialize)]
-    struct HwInfo {
-        transport: &'static str,
-        app: &'static str,
-        version: String,
-        ak: String,
-        nk: String,
-        rivk: String,
-        ufvk: String,
+    struct AttestResult {
+        device: String,
+        pinned_pubkey: String,
+        verified: bool,
     }
-
     print_ok(
-        HwInfo {
-            transport: "ledger-apdu",
-            app: "hanh-zcash-ledger",
-            version: format!("{}.{}.{}", version[0], version[1], version[2]),
-            ak: hex::encode(&fvk.ak),
-            nk: hex::encode(&fvk.nk),
-            rivk: hex::encode(&fvk.rivk),
-            ufvk: ufvk_str,
+        AttestResult {
+            device: device.clone(),
+            pinned_pubkey: pubkey_hex,
+            verified: true,
         },
         cfg.human,
         |r| {
-            println!("Ledger connected (app: {}, v{}).", r.app, r.version);
-            println!("  ak:   {}", r.ak);
-            println!("  nk:   {}", r.nk);
-            println!("  rivk: {}", r.rivk);
-            println!("  ufvk: {}", r.ufvk);
+            println!(
+                "Attestation OK: device on {} matches pinned pubkey {}...",
+                r.device,
+                &r.pinned_pubkey[..16]
+            );
         },
     );
-
     Ok(())
+}
+
+/// Trait-object adapter so `cmd_hw_info` and `cmd_hw_attest` can dispatch
+/// across the four concrete `DeviceSigner<T>` variants without leaking
+/// the transport generics into every call site.
+trait HwSignerInfoOps {
+    fn pair_identity(&mut self) -> Result<[u8; 32]>;
+    fn attest_dyn(&mut self, pinned: &[u8; 32]) -> Result<()>;
+    fn export_fvk_dyn(&mut self) -> Result<zcash_hw_wallet_sdk::ExportedFvk>;
+}
+
+/// Dispatch a `--device` string to the right transport:
+///   - `ledger`               → connect_ledger (HID)
+///   - `speculos[:host:port]` → connect_speculos (Ledger emulator over TCP, APDU)
+///   - `tcp:host:port`        → TcpTransport (raw HWP, virtual-device fixture)
+///   - everything else        → connect_serial (USB CDC for Flipper / ESP32)
+fn connect_dispatch(device: &str, coin_type: u32) -> Result<Box<dyn HwSignerInfoOps>> {
+    if device == "ledger" {
+        Ok(Box::new(zcash_hw_wallet_sdk::signer::connect_ledger(coin_type)
+            .map_err(|e| anyhow::anyhow!("Ledger connect failed: {:?}", e))?))
+    } else if device.starts_with("speculos") {
+        let addr = if device.contains(':') {
+            device.strip_prefix("speculos:").unwrap_or("127.0.0.1:9999")
+        } else {
+            "127.0.0.1:9999"
+        };
+        Ok(Box::new(zcash_hw_wallet_sdk::signer::connect_speculos(addr, coin_type)
+            .map_err(|e| anyhow::anyhow!("Speculos connect failed: {:?}", e))?))
+    } else if let Some(addr) = device.strip_prefix("tcp:") {
+        // Raw HWP over TCP — used to talk to the in-tree virtual-device
+        // fixture. Real signers expose HWP over USB CDC; use a serial path
+        // (e.g. /dev/ttyACM0 for Flipper Zero) for those.
+        let transport = zcash_hw_wallet_sdk::transport::TcpTransport::connect(addr)
+            .map_err(|e| anyhow::anyhow!("TCP connect failed: {:?}", e))?;
+        Ok(Box::new(zcash_hw_wallet_sdk::DeviceSigner::new(transport, coin_type)
+            .map_err(|e| anyhow::anyhow!("Handshake failed: {:?}", e))?))
+    } else {
+        Ok(Box::new(zcash_hw_wallet_sdk::signer::connect_serial(device, coin_type)
+            .map_err(|e| anyhow::anyhow!("Serial connect failed: {:?}", e))?))
+    }
+}
+
+impl<T: zcash_hw_wallet_sdk::transport::Transport> HwSignerInfoOps
+    for zcash_hw_wallet_sdk::DeviceSigner<T>
+{
+    fn pair_identity(&mut self) -> Result<[u8; 32]> {
+        self.pair().map_err(|e| anyhow::anyhow!("{:?}", e))
+    }
+    fn attest_dyn(&mut self, pinned: &[u8; 32]) -> Result<()> {
+        zcash_hw_wallet_sdk::HardwareSigner::coin_type(self); // sanity touch
+        self.attest(pinned).map_err(|e| anyhow::anyhow!("{:?}", e))
+    }
+    fn export_fvk_dyn(&mut self) -> Result<zcash_hw_wallet_sdk::ExportedFvk> {
+        use zcash_hw_wallet_sdk::HardwareSigner;
+        self.export_fvk().map_err(|e| anyhow::anyhow!("{:?}", e))
+    }
 }
 
 /// Run the hardware-wallet confirm flow, dispatching by transport type.
@@ -1401,6 +1488,16 @@ async fn hw_confirm(
         };
         let signer = zcash_hw_wallet_sdk::signer::connect_speculos(addr, coin_type)
             .map_err(|e| anyhow::anyhow!("Speculos connect failed: {:?}", e))?;
+        return zipher_engine::hw_signer::confirm_send_hw(
+            signer, &pending.address, send_amount, fee, pending.memo.clone(),
+        ).await;
+    }
+    if let Some(addr) = device.strip_prefix("tcp:") {
+        // Raw HWP over TCP — fixture path (virtual-device).
+        let transport = zcash_hw_wallet_sdk::transport::TcpTransport::connect(addr)
+            .map_err(|e| anyhow::anyhow!("TCP connect failed: {:?}", e))?;
+        let signer = zcash_hw_wallet_sdk::DeviceSigner::new(transport, coin_type)
+            .map_err(|e| anyhow::anyhow!("Handshake failed: {:?}", e))?;
         return zipher_engine::hw_signer::confirm_send_hw(
             signer, &pending.address, send_amount, fee, pending.memo.clone(),
         ).await;
@@ -2659,7 +2756,10 @@ async fn main() {
     let cfg = resolve_config(&cli);
 
     tracing_subscriber::fmt()
-        .with_max_level(tracing::Level::WARN)
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("warn")),
+        )
         .with_target(false)
         .init();
 
@@ -2738,8 +2838,10 @@ async fn main() {
             SessionCmd::Close { session_id } => cmd_session_close(&cfg, session_id).await,
         },
         Commands::HwWallet(sub) => match sub {
-            HwWalletCmd::Pair { device, birthday } => cmd_hw_pair(&cfg, device, birthday).await,
-            HwWalletCmd::Info => cmd_hw_info(&cfg).await,
+            HwWalletCmd::Pair { device, birthday, probe } => {
+                cmd_hw_pair(&cfg, device, birthday, probe).await
+            }
+            HwWalletCmd::Attest { device, pubkey } => cmd_hw_attest(&cfg, device, pubkey).await,
         },
     };
 

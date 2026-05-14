@@ -15,7 +15,7 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 secrecy = "0.8"
 tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["fmt"] }
+tracing-subscriber = { version = "0.3", features = ["fmt", "env-filter"] }
 dirs = "6"
 ctrlc = "3"
 anyhow = "1"
@@ -25,4 +25,4 @@ toml = "0.8"
 sha2 = "0.10.9"
 reqwest = "0.13.2"
 hex = "0.4.3"
-zcash-hw-wallet-sdk = { path = "../../../zcash-hw-wallet-sdk", features = ["serial", "ledger"] }
+zcash-hw-wallet-sdk = { path = "../../../zcash-hw-wallet-sdk", features = ["serial", "ledger", "tcp"] }
