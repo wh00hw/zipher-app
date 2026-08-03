@@ -901,7 +901,12 @@ async fn refresh_transparent_utxos(
             let outpoint = OutPoint::new(txid_arr, index);
             let txout = TxOut::new(value, Script(zcash_script::script::Code(reply.script)));
 
-            if let Some(output) = WalletTransparentOutput::from_parts(outpoint, txout, Some(height)) {
+            // 292e7584: from_parts gained recipient_account / recipient_key_scope
+            // / funding_account (all Option). We don't have them from a bare
+            // UTXO reply, so pass None — the wallet backfills ownership on scan.
+            if let Some(output) =
+                WalletTransparentOutput::from_parts(outpoint, txout, Some(height), None, None, None)
+            {
                 db_data
                     .put_received_transparent_utxo(&output)
                     .map_err(|e| anyhow::anyhow!("put_received_transparent_utxo: {:?}", e))?;

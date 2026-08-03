@@ -11,6 +11,7 @@ use zcash_client_backend::data_api::wallet::{
     create_proposed_transactions, propose_send_max_transfer, propose_standard_transfer_to_address,
     propose_shielding, ConfirmationsPolicy, SpendingKeys,
 };
+use zcash_client_backend::data_api::wallet::input_selection::LockedInputPolicy;
 use zcash_client_backend::data_api::{InputSource, MaxSpendMode, WalletRead};
 use zcash_client_backend::fees::StandardFeeRule;
 use zcash_client_backend::proposal::Proposal;
@@ -22,7 +23,7 @@ use zcash_keys::keys::UnifiedSpendingKey;
 use zcash_proofs::prover::LocalTxProver;
 use zcash_protocol::consensus::{self, Network};
 use zcash_protocol::value::Zatoshis;
-use zcash_protocol::{PoolType, ShieldedProtocol};
+use zcash_protocol::{PoolType, ShieldedPool};
 use zcash_client_sqlite::WalletDb;
 use super::wallet::connect_lwd;
 use super::{open_wallet_db, ENGINE};
@@ -110,12 +111,16 @@ pub async fn propose_send(
             &mut db_data,
             &params,
             account_id,
-            &[ShieldedProtocol::Sapling, ShieldedProtocol::Orchard],
+            &[ShieldedPool::Sapling, ShieldedPool::Orchard, ShieldedPool::Ironwood],
             &StandardFeeRule::Zip317,
             zaddr,
             memo_bytes,
             MaxSpendMode::MaxSpendable,
             confirmations,
+            // Never draw on a locked note (documented default).
+            &LockedInputPolicy::Exclude,
+            // Do not lock the selected inputs (previous behaviour).
+            None,
         )
         .map_err(|e| anyhow::anyhow!("Proposal failed: {:?}", e))?;
 
@@ -147,7 +152,12 @@ pub async fn propose_send(
             send_zat,
             memo_bytes,
             None,
-            ShieldedProtocol::Orchard,
+            ShieldedPool::Orchard,
+            // lock_inputs: no locking (previous behaviour).
+            None,
+            // proposed_version: select the tx version from the target height
+            // (v6 post-NU6.3, which the hardware device requires).
+            None,
         )
         .map_err(|e| anyhow::anyhow!("Proposal failed: {:?}", e))?;
 
@@ -187,8 +197,8 @@ pub async fn confirm_send(seed_phrase: &SecretString) -> Result<String> {
     }
     info!("[CONFIRM]   involves transparent={}, sapling={}, orchard={}",
         step.involves(PoolType::TRANSPARENT),
-        step.involves(PoolType::Shielded(ShieldedProtocol::Sapling)),
-        step.involves(PoolType::Shielded(ShieldedProtocol::Orchard)));
+        step.involves(PoolType::Shielded(ShieldedPool::Sapling)),
+        step.involves(PoolType::Shielded(ShieldedPool::Orchard)));
 
     let engine_guard = ENGINE.lock().await;
     let engine = engine_guard
@@ -231,6 +241,8 @@ pub async fn confirm_send(seed_phrase: &SecretString) -> Result<String> {
         &spending_keys,
         OvkPolicy::Sender,
         &proposal,
+        // expiry_height: default expiry.
+        None,
     )
     .map_err(|e| {
         error!("[CONFIRM] create_proposed_transactions FAILED: {:?}", e);
@@ -346,12 +358,16 @@ pub async fn get_max_sendable(address: &str) -> Result<u64> {
             &mut db_data,
             &params,
             account_id,
-            &[ShieldedProtocol::Sapling, ShieldedProtocol::Orchard],
+            &[ShieldedPool::Sapling, ShieldedPool::Orchard, ShieldedPool::Ironwood],
             &StandardFeeRule::Zip317,
             zaddr,
             None,
             MaxSpendMode::MaxSpendable,
             confirmations,
+            // Never draw on a locked note (documented default).
+            &LockedInputPolicy::Exclude,
+            // Do not lock the selected inputs (previous behaviour).
+            None,
         );
 
     match proposal_result {
@@ -401,7 +417,11 @@ fn propose_and_create_send(
         amount,
         memo,
         None,
-        ShieldedProtocol::Orchard,
+        ShieldedPool::Orchard,
+        // lock_inputs: no locking (previous behaviour).
+        None,
+        // proposed_version: select the tx version from the target height.
+        None,
     )
     .map_err(|e| anyhow::anyhow!("Proposal failed: {:?}", e))?;
 
@@ -415,6 +435,8 @@ fn propose_and_create_send(
         &spending_keys,
         OvkPolicy::Sender,
         &proposal,
+        // expiry_height: default expiry.
+        None,
     )
     .map_err(|e| anyhow::anyhow!("Create tx failed: {:?}", e))
 }
@@ -431,7 +453,7 @@ fn propose_and_create_shielding(
         zcash_client_backend::fees::zip317::SingleOutputChangeStrategy::new(
             StandardFeeRule::Zip317,
             None,
-            ShieldedProtocol::Orchard,
+            ShieldedPool::Orchard,
             zcash_client_backend::fees::DustOutputPolicy::default(),
         );
     let greedy =
@@ -446,7 +468,9 @@ fn propose_and_create_shielding(
         from_addrs,
         to_account,
         ConfirmationsPolicy::MIN,
-        zcash_client_backend::data_api::TransparentOutputFilter::All,
+        zcash_client_backend::data_api::CoinbaseFilter::AllTransparentOutputs,
+        // lock_inputs: no locking (previous behaviour).
+        None,
     )
     .map_err(|e| anyhow::anyhow!("Shielding proposal failed: {:?}", e))?;
 
@@ -460,6 +484,8 @@ fn propose_and_create_shielding(
         &spending_keys,
         OvkPolicy::Sender,
         &proposal,
+        // expiry_height: default expiry.
+        None,
     )
     .map_err(|e| anyhow::anyhow!("Create shielding tx failed: {:?}", e))
 }

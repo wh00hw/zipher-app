@@ -934,14 +934,18 @@ async fn cmd_balance(cfg: &Config) -> Result<()> {
     let balance = zipher_engine::query::get_wallet_balance().await?;
 
     print_ok(&balance, cfg.human, |b| {
-        let total = b.sapling + b.orchard + b.transparent;
+        let total = b.sapling + b.orchard + b.ironwood + b.transparent;
         let total_zec = total as f64 / 1e8;
         println!("Balance: {:.8} ZEC ({} zat)", total_zec, total);
         println!();
+        println!("  Shielded (Ironwood): {} zat", b.ironwood);
         println!("  Shielded (Orchard):  {} zat", b.orchard);
         println!("  Shielded (Sapling):  {} zat", b.sapling);
         println!("  Transparent:         {} zat", b.transparent);
-        let pending = b.unconfirmed_sapling + b.unconfirmed_orchard + b.unconfirmed_transparent;
+        let pending = b.unconfirmed_sapling
+            + b.unconfirmed_orchard
+            + b.unconfirmed_ironwood
+            + b.unconfirmed_transparent;
         if pending > 0 {
             println!();
             println!("  Pending:             {} zat", pending);

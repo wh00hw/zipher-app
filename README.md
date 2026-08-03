@@ -68,7 +68,7 @@ The engine crate is the single source of truth for wallet logic. Every consumer 
 
 - [Flutter](https://flutter.dev) — mobile UI (iOS & Android)
 - [librustzcash](https://github.com/zcash/librustzcash) — Zcash protocol libraries and light client SDK
-- [zcash-hw-wallet-sdk](https://github.com/wh00hw/zcash-hw-wallet-sdk) + [libzcash-orchard-c](https://github.com/wh00hw/libzcash-orchard-c) — PCZT-based hardware wallet signing (Orchard + transparent, on-device ZIP-244 verification)
+- [zcash-hw-wallet-sdk](https://github.com/wh00hw/zcash-hw-wallet-sdk) + [libzcash-ironwood-c](https://github.com/wh00hw/libzcash-ironwood-c) — PCZT-based hardware wallet signing (Ironwood + sealed-Orchard turnstile + transparent, on-device ZIP-244 verification)
 - [rmcp](https://github.com/anthropics/rmcp) — Model Context Protocol server SDK
 - [NEAR Intents](https://near.org/intents) — cross-chain swap infrastructure
 

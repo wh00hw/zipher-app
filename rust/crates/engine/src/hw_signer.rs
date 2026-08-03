@@ -13,6 +13,7 @@ use zcash_client_backend::data_api::wallet::{
 use zcash_client_backend::data_api::WalletRead;
 use zcash_client_backend::wallet::OvkPolicy;
 use zcash_client_backend::proto::service::RawTransaction;
+use zcash_primitives::transaction::builder::BundlePadding;
 use zcash_hw_wallet_sdk::{
     HardwareSigner, PcztHardwareSigning, TxDetails,
 };
@@ -65,19 +66,29 @@ pub async fn confirm_send_hw<S: HardwareSigner>(
 
     // Step 1: Create PCZT from proposal (no spending key needed)
     info!("[HW-CONFIRM] Creating PCZT from proposal...");
+    // zcash_client_backend 0.24: create_pczt_from_proposal takes
+    // `expiry_height: Option<BlockHeight>` (None = default expiry) and
+    // `orchard_pool_padding: BundlePadding` (DEFAULT = the previous padded
+    // behaviour). The Ironwood bundle's padding is not caller-chosen: it is
+    // derived from the proposal by `Step::ironwood_bundle_padding`.
     let pczt = create_pczt_from_proposal::<_, _, std::convert::Infallible, _, std::convert::Infallible, _>(
         &mut db_data,
         &params,
         account_id,
         OvkPolicy::Sender,
         &proposal,
+        None,
+        BundlePadding::DEFAULT,
     )
     .map_err(|e| {
         error!("[HW-CONFIRM] create_pczt_from_proposal FAILED: {:?}", e);
         anyhow::anyhow!("Create PCZT failed: {:?}", e)
     })?;
 
-    let pczt_bytes = pczt.serialize();
+    // 292e7584: Pczt::serialize() is now fallible (deferred-anchor encoding).
+    let pczt_bytes = pczt
+        .serialize()
+        .map_err(|e| anyhow::anyhow!("PCZT serialization failed: {:?}", e))?;
     info!("[HW-CONFIRM] PCZT created: {} bytes", pczt_bytes.len());
 
     // Step 2: Sign via hardware wallet
@@ -106,7 +117,11 @@ pub async fn confirm_send_hw<S: HardwareSigner>(
     let signed_pczt = pczt::Pczt::parse(&result.signed_pczt)
         .map_err(|e| anyhow::anyhow!("Parse signed PCZT failed: {:?}", e))?;
 
-    let orchard_vk = orchard::circuit::VerifyingKey::build();
+    // orchard 0.15: VerifyingKey::build takes the circuit version. The signed
+    // tx is a post-NU6.3 v6 transaction (Ironwood / sealed-Orchard both use
+    // the PostNu6_3 circuit), and this VK verifies both bundles' proofs.
+    let orchard_vk =
+        orchard::circuit::VerifyingKey::build(orchard::circuit::OrchardCircuitVersion::PostNu6_3);
     let txid = extract_and_store_transaction_from_pczt::<_, zcash_client_sqlite::ReceivedNoteId>(
         &mut db_data,
         signed_pczt,
