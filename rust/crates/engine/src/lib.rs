@@ -59,15 +59,26 @@ pub(crate) fn open_cipher_conn(path: &Path, key: &Option<String>) -> Result<Conn
     Ok(conn)
 }
 
+/// The RNG handed to `WalletDb` and to the transaction-construction entry
+/// points of zcash_client_backend 0.25 (which no longer draw OS randomness
+/// themselves): the operating system CSPRNG. `rand_core` 0.10 models it as a
+/// fallible RNG; `UnwrapErr` panics on an OS RNG failure rather than
+/// continuing with bad randomness.
+pub(crate) type WalletRng = rand::rand_core::UnwrapErr<rand::rngs::SysRng>;
+
+pub(crate) fn wallet_rng() -> WalletRng {
+    rand::rand_core::UnwrapErr(rand::rngs::SysRng)
+}
+
 /// Open a `WalletDb` with optional SQLCipher encryption via `from_connection`.
 pub(crate) fn open_wallet_db(
     path: &Path,
     params: Network,
     key: &Option<String>,
-) -> Result<WalletDb<Connection, Network, SystemClock, rand::rngs::OsRng>> {
+) -> Result<WalletDb<Connection, Network, SystemClock, WalletRng>> {
     let conn = open_cipher_conn(path, key)?;
     rusqlite::vtab::array::load_module(&conn)?;
-    Ok(WalletDb::from_connection(conn, params, SystemClock, rand::rngs::OsRng))
+    Ok(WalletDb::from_connection(conn, params, SystemClock, wallet_rng()))
 }
 
 /// Migrate an existing unencrypted database to SQLCipher encryption.

@@ -3,7 +3,7 @@ use secrecy::SecretVec;
 
 use zcash_client_backend::data_api::{AccountBirthday, WalletRead, WalletWrite};
 use zcash_client_backend::proto::service::{
-    compact_tx_streamer_client::CompactTxStreamerClient, BlockId, ChainSpec,
+    compact_tx_streamer_client::CompactTxStreamerClient, ChainSpec,
 };
 use zcash_client_sqlite::wallet::init::init_wallet_db;
 use zcash_protocol::consensus::{BlockHeight, Network};
@@ -25,19 +25,21 @@ pub(crate) async fn connect_lwd(
     Ok(CompactTxStreamerClient::new(channel))
 }
 
+/// The tree state a wallet birthday is built from, validated against the
+/// block lightwalletd serves at that height (`GetBlock`): the account's
+/// starting note-commitment frontiers must belong to the chain the wallet
+/// will then scan. See `sync::fetch_validated_tree_state` for why a
+/// by-height `GetTreeState` cannot be taken on trust.
 async fn fetch_tree_state(
     server_url: &str,
     height: u64,
 ) -> Result<zcash_client_backend::proto::service::TreeState> {
+    let height = u32::try_from(height)
+        .map(BlockHeight::from_u32)
+        .map_err(|_| anyhow::anyhow!("birthday height {} out of range", height))?;
     let mut client = connect_lwd(server_url).await?;
-    let resp = client
-        .get_tree_state(BlockId {
-            height,
-            hash: vec![],
-        })
-        .await
-        .map_err(|e| anyhow::anyhow!("get_tree_state failed: {:?}", e))?;
-    Ok(resp.into_inner())
+    let block_hash = super::sync::fetch_block_hash(&mut client, height).await?;
+    super::sync::fetch_validated_tree_state(&mut client, height, Some(block_hash)).await
 }
 
 pub async fn fetch_latest_height(server_url: &str) -> Result<u64> {

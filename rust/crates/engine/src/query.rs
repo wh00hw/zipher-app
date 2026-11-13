@@ -80,7 +80,11 @@ pub async fn get_transparent_addresses() -> Result<Vec<String>> {
         Some(ua) => {
             if let Some(taddr) = ua.transparent() {
                 let net = network_type(&engine.params);
-                let encoded = taddr.to_zcash_address(net).encode();
+                // zcash_transparent 0.11 no longer depends on zcash_address;
+                // the conversion lives on zcash_keys' Receiver.
+                let encoded = zcash_keys::address::Receiver::Transparent(*taddr)
+                    .to_zcash_address(net)
+                    .encode();
                 Ok(vec![encoded])
             } else {
                 Ok(vec![])
@@ -331,8 +335,12 @@ pub async fn export_ufvk() -> Result<Option<String>> {
 
     match account {
         Some(acct) => {
-            let ufvk = acct.ufvk().map(|k| k.encode(&engine.params));
-            Ok(ufvk)
+            // zcash_keys 0.17: UFVK/UIVK string encoding is fallible
+            // (ZIP 316 revision selection).
+            acct.ufvk()
+                .map(|k| k.encode(&engine.params))
+                .transpose()
+                .map_err(|e| anyhow::anyhow!("UFVK encoding failed: {:?}", e))
         }
         None => Ok(None),
     }
@@ -359,10 +367,10 @@ pub async fn export_uivk() -> Result<Option<String>> {
 
     match account {
         Some(acct) => {
-            let uivk = acct
-                .ufvk()
-                .map(|k| k.to_unified_incoming_viewing_key().encode(&engine.params));
-            Ok(uivk)
+            acct.ufvk()
+                .map(|k| k.to_unified_incoming_viewing_key().encode(&engine.params))
+                .transpose()
+                .map_err(|e| anyhow::anyhow!("UIVK encoding failed: {:?}", e))
         }
         None => Ok(None),
     }

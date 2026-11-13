@@ -12,7 +12,7 @@ anyhow = "1"
 hex = "0.4"
 tracing = "0.1"
 tokio = { version = "1", features = ["full"] }
-rand = "0.8"
+rand = "0.10"
 secrecy = "0.8"
 zeroize = "1"
 lazy_static = "1"
@@ -24,22 +24,22 @@ rusqlite = { version = "0.37", features = ["bundled-sqlcipher-vendored-openssl"]
 bip0039 = { version = "0.14", features = ["rand"] }
 
 # Zcash crates
-zcash_protocol = "0.10.3"
-zcash_address = "0.13.0"
-zcash_client_backend = { version = "0.24.0-rc.6", features = ["lightwalletd-tonic", "transparent-inputs", "pczt"] }
-zcash_client_sqlite = { version = "0.22.0-rc.6", features = ["orchard", "transparent-inputs", "serde"] }
-zcash_keys = { version = "0.16.1", features = ["orchard", "sapling"] }
-zcash_primitives = "0.30.0"
-zcash_proofs = "0.30.0"
-zcash_transparent = "0.10.0"
-zcash_script = "0.4"
-zip32 = "0.2"
-sapling-crypto = { version = "0.7", package = "sapling-crypto" }
-orchard = "0.15.5"
-incrementalmerkletree = "0.8"
+zcash_protocol = "0.11.0"
+zcash_address = "0.14.0"
+zcash_client_backend = { version = "0.25.0", features = ["lightwalletd-tonic", "transparent-inputs", "pczt"] }
+zcash_client_sqlite = { version = "0.23.0", features = ["orchard", "transparent-inputs", "serde"] }
+zcash_keys = { version = "0.17.0", features = ["orchard", "sapling"] }
+zcash_primitives = "0.31.0"
+zcash_proofs = "0.31.0"
+zcash_transparent = "0.11.0"
+zcash_script = "0.6"
+zip32 = "0.3"
+sapling-crypto = { version = "0.9", package = "sapling-crypto" }
+orchard = "0.16.0"
+incrementalmerkletree = "0.9"
 rustls = { version = "0.23", features = ["ring"] }
 reqwest = { version = "0.13", features = ["json"] }
 
 # Hardware wallet signing
 zcash-hw-wallet-sdk = { path = "../../../zcash-hw-wallet-sdk" }
-pczt = { version = "0.9.1", features = ["prover", "signer", "sapling", "orchard"] }
+pczt = { version = "0.10.0", features = ["prover", "signer", "sapling", "orchard"] }

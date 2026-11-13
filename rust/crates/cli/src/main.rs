@@ -338,6 +338,15 @@ enum SendCmd {
         #[arg(long)]
         to: String,
     },
+
+    /// Broadcast again a transaction this wallet already signed and stored
+    /// (e.g. after a failed broadcast). Nothing is re-signed; refuses a
+    /// transaction that is already mined or has expired.
+    Rebroadcast {
+        /// Transaction ID (hex)
+        #[arg(long)]
+        txid: String,
+    },
 }
 
 #[derive(Subcommand)]
@@ -454,7 +463,9 @@ fn print_err(e: &anyhow::Error, human: bool) {
 // ---------------------------------------------------------------------------
 
 const DEFAULT_MAINNET_SERVER: &str = "https://lightwalletd.mainnet.cipherscan.app:443";
-const DEFAULT_TESTNET_SERVER: &str = "https://lightwalletd.testnet.cipherscan.app:443";
+// lightwalletd.testnet.cipherscan.app no longer serves gRPC on :443 (TLS
+// handshake fails: no HTTP/2 ALPN, certificate for another host name).
+const DEFAULT_TESTNET_SERVER: &str = "https://testnet.zec.rocks:443";
 
 struct Config {
     data_dir: String,
@@ -654,7 +665,71 @@ async fn auto_open(cfg: &Config) -> Result<()> {
 // Auto-sync if wallet is stale
 // ---------------------------------------------------------------------------
 
-const STALE_BLOCK_THRESHOLD: u32 = 10;
+/// How many blocks behind the tip a read-only command tolerates before it
+/// syncs first: ~12.5 minutes of chain, i.e. 30 blocks at NU7's 25 s target
+/// spacing (it was 10 blocks at 75 s).
+const STALE_BLOCK_THRESHOLD: u32 = 30;
+
+/// Longest a signing command waits for the wallet to reach the tip before
+/// giving up and asking for an explicit `sync start`.
+const SIGNING_SYNC_TIMEOUT_SECS: u64 = 300;
+
+/// Run the engine sync until the wallet's scan queue is empty at the current
+/// chain tip, for at most `timeout_secs`. The wallet is left open.
+async fn sync_to_tip(cfg: &Config, timeout_secs: u64) -> Result<u32> {
+    zipher_engine::sync::start().await?;
+    let started = std::time::Instant::now();
+    let outcome = loop {
+        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+        let p = zipher_engine::sync::get_progress().await;
+        if zipher_engine::sync::caught_up() {
+            break Ok(p.synced_height);
+        }
+        if !zipher_engine::sync::is_running() {
+            break Err(anyhow::anyhow!("sync stopped at height {}", p.synced_height));
+        }
+        if started.elapsed().as_secs() >= timeout_secs {
+            break Err(match p.connection_error {
+                Some(e) => anyhow::anyhow!(
+                    "wallet could not be synced within {} s: {}",
+                    timeout_secs, e
+                ),
+                None => anyhow::anyhow!(
+                    "wallet is still syncing after {} s (at {}, tip {}); run `zipher-cli sync start` and retry",
+                    timeout_secs, p.synced_height, p.latest_height
+                ),
+            });
+        }
+    };
+    zipher_engine::sync::stop().await;
+    zipher_engine::wallet::close().await;
+    auto_open(cfg).await?;
+    outcome
+}
+
+/// Before building a transaction for a signer: the wallet must be at the
+/// chain tip. The proposal's target height is "last scanned block + 1" and
+/// the default expiry is target + 120 blocks, so a wallet a few dozen
+/// minutes stale would have the device sign a transaction that has already
+/// expired (and a stale anchor / note set besides).
+async fn ensure_synced_for_signing(cfg: &Config) -> Result<()> {
+    auto_open(cfg).await?;
+    let synced = zipher_engine::query::get_synced_height().await.unwrap_or(0);
+    let latest = zipher_engine::wallet::fetch_latest_height(&cfg.server_url)
+        .await
+        .map_err(|e| anyhow::anyhow!("cannot reach {} to check the chain tip: {:#}", cfg.server_url, e))?
+        as u32;
+    if synced >= latest {
+        return Ok(());
+    }
+    eprintln!(
+        "Wallet is {} block(s) behind (at {}, tip {}). Syncing before signing...",
+        latest - synced, synced, latest
+    );
+    let height = sync_to_tip(cfg, SIGNING_SYNC_TIMEOUT_SECS).await?;
+    eprintln!("Synced to {}.", height);
+    Ok(())
+}
 
 async fn sync_if_needed(cfg: &Config) -> Result<()> {
     auto_open(cfg).await?;
@@ -699,7 +774,10 @@ async fn sync_if_needed(cfg: &Config) -> Result<()> {
             tokio::time::sleep(std::time::Duration::from_secs(2)).await;
             let p = zipher_engine::sync::get_progress().await;
 
-            if p.synced_height > 0 && p.synced_height >= p.latest_height {
+            // "Caught up" comes from the wallet's scan queue being empty at
+            // the tip, not from synced_height >= latest_height (true as soon
+            // as the tip range is scanned, with older ranges still pending).
+            if zipher_engine::sync::caught_up() {
                 eprintln!("Synced to {}.", p.synced_height);
                 break;
             }
@@ -882,7 +960,11 @@ async fn cmd_sync_start(cfg: &Config) -> Result<()> {
             break;
         }
 
-        if !p.is_syncing && p.synced_height > 0 && p.synced_height >= p.latest_height {
+        // The engine keeps following the tip for as long as it runs, so
+        // `is_syncing` never clears by itself; "done" is the wallet's scan
+        // queue being empty at the current tip.
+        if zipher_engine::sync::caught_up() && p.connection_error.is_none() {
+            zipher_engine::sync::stop().await;
             if cfg.human {
                 eprintln!("\nFully synced at height {}.", p.synced_height);
             }
@@ -1213,7 +1295,9 @@ async fn cmd_send_confirm_hw(cfg: &Config, device: String) -> Result<()> {
         return Err(anyhow::anyhow!("{}", violation));
     }
 
-    auto_open(cfg).await?;
+    // The proposal is rebuilt here, at "wallet tip + 1": make sure that is
+    // the real chain tip before the device is asked to sign anything.
+    ensure_synced_for_signing(cfg).await?;
 
     let (send_amount, fee, _) = zipher_engine::send::propose_send(
         &pending.address,
@@ -1246,6 +1330,14 @@ async fn cmd_send_confirm_hw(cfg: &Config, device: String) -> Result<()> {
                 Some(send_amount), Some(fee), pending.context_id.as_deref(),
                 None, Some(&format!("{:#}", e)),
             ).ok();
+            // Signed and stored but not broadcast: the proposal has been
+            // consumed (its inputs are reserved by the stored transaction),
+            // so confirming it again could only fail. Drop it; the way
+            // forward is `send rebroadcast --txid <txid>`, named in the
+            // error.
+            if e.downcast_ref::<zipher_engine::hw_signer::BroadcastFailed>().is_some() {
+                delete_pending(&cfg.data_dir);
+            }
             return Err(e);
         }
     };
@@ -1511,6 +1603,24 @@ async fn hw_confirm(
     zipher_engine::hw_signer::confirm_send_hw(
         signer, &pending.address, send_amount, fee, pending.memo.clone(),
     ).await
+}
+
+async fn cmd_send_rebroadcast(cfg: &Config, txid: String) -> Result<()> {
+    auto_open(cfg).await?;
+    let result = zipher_engine::hw_signer::rebroadcast(&txid).await;
+    zipher_engine::audit::log_event(
+        &cfg.data_dir, "rebroadcast", None, None, None, None,
+        result.as_ref().ok().map(|r| r.txid.as_str()),
+        result.as_ref().err().map(|e| format!("{:#}", e)).as_deref(),
+    ).ok();
+    let outcome = result?;
+    print_ok(outcome, cfg.human, |r| {
+        println!("Transaction rebroadcast.");
+        println!("  txid:   {}", r.txid);
+        println!("  expiry: {} (chain tip {})", r.expiry_height, r.chain_tip);
+    });
+    zipher_engine::wallet::close().await;
+    Ok(())
 }
 
 async fn cmd_send_max(cfg: &Config, to: String) -> Result<()> {
@@ -2792,6 +2902,7 @@ async fn main() {
             SendCmd::Confirm => cmd_send_confirm(&cfg).await,
             SendCmd::ConfirmHw { device } => cmd_send_confirm_hw(&cfg, device).await,
             SendCmd::Max { to } => cmd_send_max(&cfg, to).await,
+            SendCmd::Rebroadcast { txid } => cmd_send_rebroadcast(&cfg, txid).await,
         },
         Commands::Shield => cmd_shield(&cfg).await,
         Commands::Policy(sub) => match sub {

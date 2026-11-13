@@ -28,7 +28,7 @@ use zcash_client_sqlite::WalletDb;
 use super::wallet::connect_lwd;
 use super::{open_wallet_db, ENGINE};
 
-type DbType = WalletDb<rusqlite::Connection, Network, SystemClock, rand::rngs::OsRng>;
+type DbType = WalletDb<rusqlite::Connection, Network, SystemClock, super::WalletRng>;
 type ProposalType = Proposal<StandardFeeRule, ReceivedNoteId>;
 
 use zcash_client_sqlite::util::SystemClock;
@@ -236,6 +236,10 @@ pub async fn confirm_send(seed_phrase: &SecretString) -> Result<String> {
     >(
         &mut db_data,
         &params,
+        // zcash_client_backend 0.25: explicit clock (creation timestamps,
+        // ZIP 316 R2 address expiry) and RNG (previously the OS RNG).
+        &SystemClock,
+        &mut super::wallet_rng(),
         &prover,
         &prover,
         &spending_keys,
@@ -430,6 +434,8 @@ fn propose_and_create_send(
     create_proposed_transactions::<_, _, std::convert::Infallible, _, std::convert::Infallible, _>(
         db_data,
         params,
+        &SystemClock,
+        &mut super::wallet_rng(),
         prover,
         prover,
         &spending_keys,
@@ -479,6 +485,8 @@ fn propose_and_create_shielding(
     create_proposed_transactions::<_, _, std::convert::Infallible, _, std::convert::Infallible, _>(
         db_data,
         params,
+        &SystemClock,
+        &mut super::wallet_rng(),
         prover,
         prover,
         &spending_keys,

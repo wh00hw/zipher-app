@@ -5,6 +5,7 @@ use anyhow::Result;
 use prost::Message;
 use tokio::sync::Mutex as TokioMutex;
 
+use zcash_client_backend::data_api::chain::error::Error as ChainError;
 use zcash_client_backend::data_api::chain::{scan_cached_blocks, BlockSource, CommitmentTreeRoot};
 use zcash_client_backend::data_api::scanning::ScanPriority;
 use zcash_client_backend::data_api::wallet::ConfirmationsPolicy;
@@ -12,7 +13,7 @@ use zcash_client_backend::data_api::{WalletCommitmentTrees, WalletRead, WalletWr
 use zcash_client_backend::proto::compact_formats::CompactBlock;
 use zcash_client_backend::proto::service::{
     compact_tx_streamer_client::CompactTxStreamerClient, BlockId, BlockRange, ChainSpec,
-    GetAddressUtxosArg, GetSubtreeRootsArg, ShieldedProtocol,
+    GetAddressUtxosArg, GetSubtreeRootsArg, ShieldedProtocol, TreeState,
 };
 use zcash_client_backend::wallet::WalletTransparentOutput;
 use zcash_client_sqlite::WalletDb;
@@ -22,6 +23,7 @@ use zcash_protocol::value::Zatoshis;
 use zcash_transparent::address::Script;
 use zcash_transparent::bundle::{OutPoint, TxOut};
 
+use zcash_primitives::block::BlockHash;
 use zcash_primitives::merkle_tree::HashSer;
 
 use super::wallet::connect_lwd;
@@ -33,6 +35,19 @@ use super::{open_wallet_db, open_cipher_conn, ENGINE};
 
 static SYNC_RUNNING: AtomicBool = AtomicBool::new(false);
 static SYNC_CANCEL: AtomicBool = AtomicBool::new(false);
+/// Set when a sync pass ends with the wallet reporting nothing left to scan
+/// up to the chain tip fetched in that same pass (see `caught_up`).
+static SYNC_CAUGHT_UP: AtomicBool = AtomicBool::new(false);
+
+/// How far below the failing block the wallet is rewound when a chain
+/// continuity error (reorg) is detected — the same margin upstream
+/// `zcash_client_backend::sync` uses.
+const REORG_REWIND_BLOCKS: u32 = 10;
+/// Pause after a rewind before rescanning, doubled on each consecutive
+/// rewind up to the maximum, so that a server which keeps serving an
+/// inconsistent chain cannot spin the loop.
+const REORG_BACKOFF_SECS: u64 = 5;
+const REORG_BACKOFF_MAX_SECS: u64 = 60;
 
 lazy_static::lazy_static! {
     static ref SYNC_PROGRESS: TokioMutex<SyncProgressInfo> =
@@ -81,6 +96,7 @@ pub async fn start() -> Result<()> {
 
     SYNC_RUNNING.store(true, Ordering::SeqCst);
     SYNC_CANCEL.store(false, Ordering::SeqCst);
+    SYNC_CAUGHT_UP.store(false, Ordering::SeqCst);
     {
         let mut p = SYNC_PROGRESS.lock().await;
         p.is_syncing = true;
@@ -126,6 +142,18 @@ pub async fn stop() {
 
 pub fn is_running() -> bool {
     SYNC_RUNNING.load(Ordering::SeqCst)
+}
+
+/// `true` once the running sync has completed a pass in which the wallet had
+/// no range left to scan — nothing unscanned anywhere between the account
+/// birthday and the chain tip fetched at the start of that pass. This is the
+/// wallet's own scan queue (`suggest_scan_ranges`) speaking, not a
+/// comparison of the last scanned height with the tip (which can be true
+/// while older ranges are still pending, because the tip range is scanned
+/// first). Reset to `false` by `start()` and whenever a later pass finds
+/// work again (new blocks, a reorg rewind).
+pub fn caught_up() -> bool {
+    SYNC_CAUGHT_UP.load(Ordering::SeqCst)
 }
 
 pub async fn get_progress() -> SyncProgressInfo {
@@ -356,6 +384,7 @@ async fn sync_loop(
     }
 
     let batch_size: u32 = 100;
+    let mut consecutive_rewinds: u32 = 0;
 
     loop {
         if SYNC_CANCEL.load(Ordering::SeqCst) {
@@ -389,6 +418,13 @@ async fn sync_loop(
             .suggest_scan_ranges()
             .map_err(|e| anyhow::anyhow!("suggest_scan_ranges: {:?}", e))?;
 
+        let has_work = scan_ranges
+            .iter()
+            .any(|range| range.priority() > ScanPriority::Scanned);
+        if has_work {
+            SYNC_CAUGHT_UP.store(false, Ordering::SeqCst);
+        }
+
         if scan_ranges.is_empty() {
             tracing::info!("[engine sync] no more ranges to scan, done");
             let fsh = db_data
@@ -400,7 +436,11 @@ async fn sync_loop(
             if fsh > 0 {
                 let mut p = SYNC_PROGRESS.lock().await;
                 p.synced_height = fsh;
+                p.latest_height = u32::from(tip_height);
                 tracing::info!("[engine sync] set synced_height to fully_scanned_height={}", fsh);
+            }
+            if !has_work && fsh > 0 {
+                SYNC_CAUGHT_UP.store(true, Ordering::SeqCst);
             }
             break;
         }
@@ -416,8 +456,13 @@ async fn sync_loop(
         tracing::info!("[engine sync] {} scan ranges to process", scan_ranges.len());
 
         let mut any_scanned = false;
+        // Set when a reorg rewind invalidated the scan ranges of this pass.
+        let mut rewound = false;
 
         for range in &scan_ranges {
+            if rewound {
+                break;
+            }
             if range.priority() <= ScanPriority::Scanned {
                 continue;
             }
@@ -449,7 +494,6 @@ async fn sync_loop(
                     "[engine sync] downloading blocks {}..{}",
                     u32::from(current), u32::from(batch_end)
                 );
-                let chain_state = download_chain_state(&mut lwd, current).await?;
                 let blocks = download_blocks(&mut lwd, current, batch_end).await?;
                 tracing::info!(
                     "[engine sync] downloaded {} blocks, scanning...",
@@ -458,6 +502,12 @@ async fn sync_loop(
                 if blocks.is_empty() {
                     break;
                 }
+                // The chain state the batch is scanned from must describe the
+                // block the batch actually builds on: pin it to the first
+                // block's `prevHash` (see `download_chain_state`).
+                let chain_state =
+                    download_chain_state(&mut lwd, current, parent_hash_of_batch(&blocks, current))
+                        .await?;
 
                 db_cache
                     .insert_blocks(&blocks)
@@ -482,6 +532,7 @@ async fn sync_loop(
 
                 match scan_result {
                     Ok(summary) => {
+                        consecutive_rewinds = 0;
                         let scanned_end = u32::from(summary.scanned_range().end);
                         let scanned = scanned_end
                             - u32::from(summary.scanned_range().start);
@@ -497,31 +548,59 @@ async fn sync_loop(
                             p.synced_height = scanned_end;
                         }
                     }
-                    Err(e) => {
-                        let err_str = format!("{:?}", e);
-                        tracing::warn!("[engine sync] scan error: {}", err_str);
-
+                    Err(ChainError::Scan(scan_err)) if scan_err.is_continuity_error() => {
+                        // The blocks do not connect to what the wallet has
+                        // already scanned: a chain reorganisation. The wallet
+                        // DB's own record of the block below is stale, so
+                        // rewinding to just below the failing block is not
+                        // enough (if the wallet had scanned the replaced tip
+                        // T, block T+1 fails and "T" is exactly what must
+                        // go). Rewind well below it, as upstream does.
                         db_cache
                             .clear_range(u32::from(current), u32::from(batch_end))
                             .ok();
-
-                        if err_str.contains("PrevHash")
-                            || err_str.contains("Continuity")
-                            || err_str.contains("ChainInvalid")
-                            || err_str.contains("BlockConflict")
+                        let at_height = scan_err.at_height();
+                        let rewind_to = at_height.saturating_sub(REORG_REWIND_BLOCKS);
+                        tracing::warn!(
+                            "[engine sync] chain reorg detected at {} ({:?}); rewinding to {}",
+                            u32::from(at_height),
+                            scan_err,
+                            u32::from(rewind_to)
+                        );
+                        let truncated_to = db_data
+                            .truncate_to_height(rewind_to)
+                            .map_err(|e| anyhow::anyhow!("truncate_to_height: {:?}", e))?;
+                        tracing::info!(
+                            "[engine sync] wallet rewound to {}",
+                            u32::from(truncated_to)
+                        );
                         {
-                            let reorg_height = current - 1;
-                            tracing::info!(
-                                "[engine sync] reorg detected, truncating to {}",
-                                u32::from(reorg_height)
-                            );
-                            db_data
-                                .truncate_to_height(reorg_height)
-                                .map_err(|e| {
-                                    anyhow::anyhow!("truncate_to_height: {:?}", e)
-                                })?;
-                            any_scanned = true;
+                            let mut p = SYNC_PROGRESS.lock().await;
+                            p.synced_height = u32::from(truncated_to);
                         }
+
+                        // Back off before rescanning.
+                        let pause = (REORG_BACKOFF_SECS << consecutive_rewinds.min(4))
+                            .min(REORG_BACKOFF_MAX_SECS);
+                        consecutive_rewinds = consecutive_rewinds.saturating_add(1);
+                        for _ in 0..pause {
+                            if SYNC_CANCEL.load(Ordering::SeqCst) {
+                                return Err(anyhow::anyhow!("Sync cancelled"));
+                            }
+                            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                        }
+                        // The scan ranges are stale now: ask the wallet again.
+                        rewound = true;
+                        break;
+                    }
+                    Err(e) => {
+                        // Not a reorg (wallet / block-source error, or a scan
+                        // error that is not about continuity): leave this
+                        // range for the next pass.
+                        tracing::warn!("[engine sync] scan error: {:?}", e);
+                        db_cache
+                            .clear_range(u32::from(current), u32::from(batch_end))
+                            .ok();
                         break;
                     }
                 }
@@ -542,6 +621,10 @@ async fn sync_loop(
             }
         }
 
+        if rewound {
+            continue;
+        }
+
         if !any_scanned {
             tracing::info!("[engine sync] no actionable ranges, checking fully_scanned_height");
             let fsh = db_data
@@ -553,7 +636,11 @@ async fn sync_loop(
             if fsh > 0 {
                 let mut p = SYNC_PROGRESS.lock().await;
                 p.synced_height = fsh;
+                p.latest_height = u32::from(tip_height);
                 tracing::info!("[engine sync] set synced_height to fully_scanned_height={}", fsh);
+            }
+            if !has_work && fsh > 0 {
+                SYNC_CAUGHT_UP.store(true, Ordering::SeqCst);
             }
             break;
         }
@@ -646,11 +733,13 @@ async fn sync_inactive_wallet_batch(
         let range_start = range.block_range().start;
         let batch_end = std::cmp::min(range_start + batch_size, range.block_range().end);
 
-        let chain_state = download_chain_state(&mut lwd, range_start).await?;
         let blocks = download_blocks(&mut lwd, range_start, batch_end).await?;
         if blocks.is_empty() {
             break;
         }
+        let chain_state =
+            download_chain_state(&mut lwd, range_start, parent_hash_of_batch(&blocks, range_start))
+                .await?;
 
         db_cache
             .insert_blocks(&blocks)
@@ -703,7 +792,7 @@ fn next_shard_index(
 
 async fn update_subtree_roots(
     lwd: &mut CompactTxStreamerClient<tonic::transport::Channel>,
-    db_data: &mut WalletDb<rusqlite::Connection, Network, zcash_client_sqlite::util::SystemClock, rand::rngs::OsRng>,
+    db_data: &mut WalletDb<rusqlite::Connection, Network, zcash_client_sqlite::util::SystemClock, super::WalletRng>,
     db_data_path: &Path,
     db_cipher_key: &Option<String>,
 ) -> Result<()> {
@@ -786,23 +875,192 @@ async fn update_subtree_roots(
     Ok(())
 }
 
-async fn download_chain_state(
+/// The hash of the block a downloaded batch builds on: the `prevHash` of its
+/// first block, provided that block is the one at `batch_start` and the
+/// server populated the field. `None` means "cannot validate" (e.g. a server
+/// that omits `prevHash`), in which case the tree state is taken on trust as
+/// before.
+fn parent_hash_of_batch(blocks: &[CompactBlock], batch_start: BlockHeight) -> Option<BlockHash> {
+    let first = blocks.first()?;
+    if first.height != u64::from(u32::from(batch_start)) {
+        return None;
+    }
+    let parent = BlockHash::try_from_slice(&first.prev_hash)?;
+    // An all-zero prevHash is what a server that does not fill the field
+    // (or the genesis block) looks like; it is not a usable expectation.
+    (parent.0 != [0u8; 32]).then_some(parent)
+}
+
+/// The block hash a lightwalletd `TreeState` claims to describe. The proto
+/// carries it as a hex string in display (big-endian) order.
+fn tree_state_block_hash(tree_state: &TreeState) -> Option<BlockHash> {
+    let mut bytes = hex::decode(&tree_state.hash).ok()?;
+    bytes.reverse();
+    BlockHash::try_from_slice(&bytes)
+}
+
+fn tree_state_is_for(tree_state: &TreeState, height: BlockHeight, hash: Option<BlockHash>) -> bool {
+    tree_state.height == u64::from(u32::from(height))
+        && match hash {
+            Some(expected) => tree_state_block_hash(tree_state) == Some(expected),
+            None => true,
+        }
+}
+
+async fn get_tree_state(
     lwd: &mut CompactTxStreamerClient<tonic::transport::Channel>,
-    block_height: BlockHeight,
-) -> Result<zcash_client_backend::data_api::chain::ChainState> {
-    let prior_height = block_height - 1;
-    let tree_state = lwd
-        .get_tree_state(BlockId {
-            height: u64::from(u32::from(prior_height)),
+    block_id: BlockId,
+) -> Result<TreeState> {
+    Ok(lwd
+        .get_tree_state(block_id)
+        .await
+        .map_err(|e| anyhow::anyhow!("get_tree_state: {:?}", e))?
+        .into_inner())
+}
+
+/// The hash of the block lightwalletd serves at `height` (`GetBlock`), i.e.
+/// the block on the chain that `GetBlockRange` scanning will follow.
+pub(crate) async fn fetch_block_hash(
+    lwd: &mut CompactTxStreamerClient<tonic::transport::Channel>,
+    height: BlockHeight,
+) -> Result<BlockHash> {
+    let block = lwd
+        .get_block(BlockId {
+            height: u64::from(u32::from(height)),
             hash: vec![],
         })
         .await
-        .map_err(|e| anyhow::anyhow!("get_tree_state: {:?}", e))?;
+        .map_err(|e| anyhow::anyhow!("get_block({}): {:?}", u32::from(height), e))?
+        .into_inner();
+    if block.height != u64::from(u32::from(height)) {
+        return Err(anyhow::anyhow!(
+            "get_block({}) returned block {}",
+            u32::from(height),
+            block.height
+        ));
+    }
+    BlockHash::try_from_slice(&block.hash)
+        .filter(|h| h.0 != [0u8; 32])
+        .ok_or_else(|| anyhow::anyhow!("get_block({}) returned no block hash", u32::from(height)))
+}
 
-    tree_state
-        .into_inner()
+/// Fetch the tree state (note commitment tree frontiers) as of the end of
+/// block `height`, and make sure it really is the state of the block the
+/// caller means.
+///
+/// `expected_hash` is the hash that block must have (for a scan batch: the
+/// `prevHash` of the batch's first block; for a wallet birthday: the hash
+/// `GetBlock` serves at that height). A lightwalletd `GetTreeState` *by
+/// height* is answered by the backing node's `z_gettreestate <height>`, and a
+/// node can resolve a height to a block that is not on the chain its
+/// `GetBlock` / `GetBlockRange` serve. Observed on `testnet.zec.rocks`
+/// (Zakura 1.7.0 behind lightwalletd v0.6.1): scattered heights — about a
+/// hundred in 4349563..4349850, and others later, e.g. 4566443, after NU7
+/// activation, so this is not a one-off historical patch — return the tree
+/// state of a stale side-chain block with a different hash, timestamp and
+/// tree sizes. Scanning from such a state fails every time with
+/// `NonSequentialBlocks` (the frontier sizes do not line up with the first
+/// block's), and a wallet whose *birthday* frontier came from one could
+/// never build a valid witness.
+///
+/// So the by-height answer is only accepted if its height is the one asked
+/// for and its block hash is the expected one. Otherwise the tree state is
+/// requested *by hash*, which names the exact block, and the answer is
+/// checked again. If no consistent state can be obtained an error is
+/// returned rather than handing the wallet frontiers from another chain.
+///
+/// With `expected_hash == None` (a server that omits `prevHash`) only the
+/// height can be checked.
+pub(crate) async fn fetch_validated_tree_state(
+    lwd: &mut CompactTxStreamerClient<tonic::transport::Channel>,
+    height: BlockHeight,
+    expected_hash: Option<BlockHash>,
+) -> Result<TreeState> {
+    let by_height = get_tree_state(
+        lwd,
+        BlockId {
+            height: u64::from(u32::from(height)),
+            hash: vec![],
+        },
+    )
+    .await?;
+    if tree_state_is_for(&by_height, height, expected_hash) {
+        return Ok(by_height);
+    }
+    let Some(expected) = expected_hash else {
+        return Err(anyhow::anyhow!(
+            "lightwalletd returned the tree state of height {} when asked for height {}",
+            by_height.height,
+            u32::from(height),
+        ));
+    };
+
+    tracing::warn!(
+        "[engine sync] tree state by height {} is for block {} (height {}) but the chain being \
+         followed has {} there; re-requesting the tree state by block hash",
+        u32::from(height),
+        by_height.hash,
+        by_height.height,
+        expected,
+    );
+
+    // lightwalletd only looks at `BlockID.hash` when `BlockID.height` is 0
+    // (a non-zero height wins and reproduces the by-height answer), so the
+    // by-hash request must leave the height unset. It hex-encodes the hash
+    // as-is into `z_gettreestate`, so it wants the display (big-endian, RPC)
+    // byte order; `BlockHash` holds the internal little-endian order used in
+    // compact blocks. Try the display order first and the internal order
+    // second (for a server that reverses it itself). Either answer is checked
+    // for both hash and height, so neither the order nor a server that
+    // ignores the hash can select a wrong block.
+    let mut display_order = expected.0;
+    display_order.reverse();
+    let mut last_err = None;
+    for hash in [display_order.to_vec(), expected.0.to_vec()] {
+        match get_tree_state(lwd, BlockId { height: 0, hash }).await {
+            Ok(state) if tree_state_is_for(&state, height, Some(expected)) => return Ok(state),
+            Ok(state) => {
+                last_err = Some(format!(
+                    "by-hash tree state is for block {} at height {}",
+                    state.hash, state.height,
+                ));
+            }
+            Err(e) => last_err = Some(format!("{:?}", e)),
+        }
+    }
+
+    Err(anyhow::anyhow!(
+        "inconsistent lightwalletd tree state at height {}: expected block {}, got {} by height, \
+         and by hash: {}",
+        u32::from(height),
+        expected,
+        by_height.hash,
+        last_err.unwrap_or_default(),
+    ))
+}
+
+/// The chain state a batch starting at `block_height` is scanned from: the
+/// validated tree state of the block before it (see
+/// [`fetch_validated_tree_state`]). The returned state is always for height
+/// `block_height - 1`, which `scan_cached_blocks` asserts.
+async fn download_chain_state(
+    lwd: &mut CompactTxStreamerClient<tonic::transport::Channel>,
+    block_height: BlockHeight,
+    expected_parent: Option<BlockHash>,
+) -> Result<zcash_client_backend::data_api::chain::ChainState> {
+    let prior_height = block_height - 1;
+    let state = fetch_validated_tree_state(lwd, prior_height, expected_parent)
+        .await?
         .to_chain_state()
-        .map_err(|e| anyhow::anyhow!("to_chain_state: {:?}", e))
+        .map_err(|e| anyhow::anyhow!("to_chain_state: {:?}", e))?;
+    if state.block_height() != prior_height {
+        return Err(anyhow::anyhow!(
+            "tree state height {} != {}",
+            u32::from(state.block_height()),
+            u32::from(prior_height)
+        ));
+    }
+    Ok(state)
 }
 
 async fn download_blocks(
@@ -844,7 +1102,7 @@ async fn download_blocks(
 // Transparent UTXO refresh
 // ---------------------------------------------------------------------------
 
-type DbType = WalletDb<rusqlite::Connection, Network, zcash_client_sqlite::util::SystemClock, rand::rngs::OsRng>;
+type DbType = WalletDb<rusqlite::Connection, Network, zcash_client_sqlite::util::SystemClock, super::WalletRng>;
 
 async fn refresh_transparent_utxos(
     lwd: &mut CompactTxStreamerClient<tonic::transport::Channel>,
